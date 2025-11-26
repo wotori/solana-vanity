@@ -3,6 +3,5 @@ and Solana CLI-compatible key dumps (base58, hex, byte array, JSON),
 with multi-threaded brute force and live stats.
 
 ```
-cargo run --release -- --prefix ekza --max-matches 0
-RUSTFLAGS="-C target-cpu=native" cargo run --release -- --prefix ekza --max-matches 1
+RUSTFLAGS="-C target-cpu=native" cargo run --release -- --prefix xyber,wotori --max-matches 0 --ignore-case
 ```
