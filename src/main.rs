@@ -12,6 +12,7 @@ fn main() {
     let config = parse_config();
 
     println!("Using {} threads", config.threads);
+    println!("Backend: {}", config.backend.name());
     println!(
         "Searching for prefixes: {}",
         config
