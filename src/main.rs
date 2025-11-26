@@ -18,21 +18,42 @@ use std::time::{Duration, Instant};
 #[derive(Parser)]
 #[command(author, version, about = "Solana vanity address finder")]
 struct Args {
-    #[arg(long, default_value = "xyber")]
-    prefix: String,
+    /// One or more desired prefixes for the base58-encoded public key
+    #[arg(long = "prefix", value_name = "PREFIX")]
+    prefixes: Vec<String>,
 
     #[arg(long = "max-matches", default_value_t = 1)]
     max_matches: u64,
+
+    /// Treat prefix matching as case-insensitive (ASCII)
+    #[arg(long = "ignore-case", default_value_t = false)]
+    ignore_case: bool,
 }
 
 fn main() {
     let args = Args::parse();
-    let prefix_str = Arc::new(args.prefix);
-    let prefix_bytes = Arc::new(prefix_str.as_bytes().to_vec());
+    let prefixes = expand_prefixes(&args.prefixes);
+    let prefix_rules = Arc::new(
+        prefixes
+            .into_iter()
+            .map(|raw| PrefixRule {
+                bytes: raw.as_bytes().to_vec(),
+                raw,
+            })
+            .collect::<Vec<_>>(),
+    );
     let max_matches = args.max_matches;
+    let ignore_case = args.ignore_case;
     let threads = num_cpus::get();
     println!("Using {} threads", threads);
-    println!("Searching for prefix: {}", prefix_str.as_str());
+    println!(
+        "Searching for prefixes: {}",
+        prefix_rules
+            .iter()
+            .map(|p| p.raw.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     match max_matches {
         0 => println!("Will keep mining indefinitely."),
         1 => println!("Will stop after finding 1 match."),
@@ -51,8 +72,6 @@ fn main() {
         let found = Arc::new(AtomicBool::new(false));
         let attempts = Arc::new(AtomicU64::new(0));
         let start = Instant::now();
-        let result_path = Arc::new(next_result_path(prefix_str.as_str()));
-
         let start_for_logger = start;
         let logger_attempts = attempts.clone();
         let logger_found = found.clone();
@@ -78,17 +97,14 @@ fn main() {
             }
         });
 
-        let prefix_for_threads = prefix_str.clone();
-        let prefix_bytes_for_threads = prefix_bytes.clone();
+        let prefix_rules_for_threads = prefix_rules.clone();
 
         scope(|s| {
             for _ in 0..threads {
-                let prefix = prefix_for_threads.clone();
-                let prefix_bytes = prefix_bytes_for_threads.clone();
                 let found = found.clone();
                 let attempts = attempts.clone();
-                let result_path = result_path.clone();
                 let start = start;
+                let rules = prefix_rules_for_threads.clone();
 
                 s.spawn(move |_| {
                     let mut rng = ChaCha20Rng::from_rng(OsRng).expect("seed rng");
@@ -109,7 +125,11 @@ fn main() {
                             .unwrap();
 
                         let candidate = &buffer[..len];
-                        if candidate.starts_with(prefix_bytes.as_slice()) {
+                        if let Some(rule) =
+                            rules
+                                .iter()
+                                .find(|rule| candidate_matches(candidate, &rule.bytes, ignore_case))
+                        {
                             if !found.swap(true, Ordering::Relaxed) {
                                 attempts.fetch_add(local_attempts, Ordering::Relaxed);
 
@@ -139,7 +159,7 @@ fn main() {
                                 let summary = format!(
                                     "[{}] Prefix: {}\nPublic key: {}\nPublic key (bytes): {}\nSecret key (hex): {}\nSecret key (bytes): {}\nSecret key (json array): {}\nAttempts: {}\nRate: {:.0} attempts/s\n",
                                     Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true),
-                                    prefix.as_str(),
+                                    rule.raw.as_str(),
                                     pub58_str,
                                     public_bytes,
                                     secret_hex,
@@ -148,7 +168,8 @@ fn main() {
                                     total_attempts,
                                     rate
                                 );
-                                append_block(result_path.as_str(), &summary);
+                                let result_file = next_result_path(rule.raw.as_str());
+                                append_block(result_file.as_str(), &summary);
                             }
                             return;
                         }
@@ -204,4 +225,51 @@ fn append_block(path: &str, block: &str) {
     {
         eprintln!("Failed to write to {}: {}", path, err);
     }
+}
+
+#[derive(Clone)]
+struct PrefixRule {
+    raw: String,
+    bytes: Vec<u8>,
+}
+
+fn expand_prefixes(raw_list: &[String]) -> Vec<String> {
+    let mut expanded = Vec::new();
+    if raw_list.is_empty() {
+        expanded.push("xyber".to_string());
+        return expanded;
+    }
+
+    for item in raw_list {
+        for part in item.split(',') {
+            let trimmed = part.trim();
+            if !trimmed.is_empty() {
+                expanded.push(trimmed.to_string());
+            }
+        }
+    }
+
+    if expanded.is_empty() {
+        expanded.push("xyber".to_string());
+    }
+
+    expanded
+}
+
+fn candidate_matches(candidate: &[u8], prefix: &[u8], ignore_case: bool) -> bool {
+    if candidate.len() < prefix.len() {
+        return false;
+    }
+    if !ignore_case {
+        candidate[..prefix.len()] == prefix[..]
+    } else {
+        candidate[..prefix.len()]
+            .iter()
+            .zip(prefix.iter())
+            .all(|(a, b)| eq_ignore_ascii_case(*a, *b))
+    }
+}
+
+fn eq_ignore_ascii_case(a: u8, b: u8) -> bool {
+    a == b || a.to_ascii_lowercase() == b.to_ascii_lowercase()
 }
