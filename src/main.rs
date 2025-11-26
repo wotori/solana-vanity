@@ -1,7 +1,8 @@
 use chrono::{SecondsFormat, Utc};
 use clap::Parser;
 use ed25519_dalek::Keypair;
-use rand::rngs::OsRng;
+use rand::{rngs::OsRng, SeedableRng};
+use rand_chacha::ChaCha20Rng;
 use rayon::scope;
 use serde_json;
 use std::fs::OpenOptions;
@@ -17,11 +18,9 @@ use std::time::{Duration, Instant};
 #[derive(Parser)]
 #[command(author, version, about = "Solana vanity address finder")]
 struct Args {
-    /// Desired prefix for the base58-encoded public key
     #[arg(long, default_value = "xyber")]
     prefix: String,
 
-    /// Number of matches to find before exiting (0 = run forever)
     #[arg(long = "max-matches", default_value_t = 1)]
     max_matches: u64,
 }
@@ -81,6 +80,7 @@ fn main() {
         });
 
         let prefix_for_threads = prefix.clone();
+
         scope(|s| {
             for _ in 0..threads {
                 let prefix = prefix_for_threads.clone();
@@ -89,51 +89,74 @@ fn main() {
                 let result_path = result_path.clone();
                 let start = start;
 
+                let prefix_bytes = prefix.as_bytes().to_vec();
+
                 s.spawn(move |_| {
-                    let mut rng = OsRng {};
+                    let mut rng = ChaCha20Rng::from_rng(OsRng).expect("seed rng");
+                    let mut buffer = [0u8; 64];
+                    let mut local_attempts = 0u64;
+
                     while !found.load(Ordering::Relaxed) {
                         let kp = Keypair::generate(&mut rng);
-                        attempts.fetch_add(1, Ordering::Relaxed);
 
-                        let pub58 = bs58::encode(kp.public.to_bytes()).into_string();
+                        local_attempts += 1;
+                        if local_attempts >= 1000 {
+                            attempts.fetch_add(local_attempts, Ordering::Relaxed);
+                            local_attempts = 0;
+                        }
 
-                        if pub58.starts_with(prefix.as_str()) {
+                        let len = bs58::encode(kp.public.to_bytes())
+                            .onto(&mut buffer[..])
+                            .unwrap();
+
+                        let pub58_str = std::str::from_utf8(&buffer[..len]).unwrap();
+
+                        if pub58_str.as_bytes().starts_with(&prefix_bytes) {
                             if !found.swap(true, Ordering::Relaxed) {
+                                attempts.fetch_add(local_attempts, Ordering::Relaxed);
+
                                 println!("Found match!");
-                                println!("Public key: {}", pub58);
-                                // kp.to_bytes() returns 64 bytes: secret + public
+                                println!("Public key: {}", pub58_str);
+
                                 let secret_full = kp.to_bytes();
                                 let secret_hex = hex::encode(secret_full);
                                 println!("Secret key (hex): {}", secret_hex);
+
                                 let elapsed = start.elapsed().as_secs_f64();
+                                let total_attempts = attempts.load(Ordering::Relaxed);
+
                                 println!(
                                     "Attempts: {} ({:.0} / sec)",
-                                    attempts.load(Ordering::Relaxed),
-                                    attempts.load(Ordering::Relaxed) as f64 / elapsed
+                                    total_attempts,
+                                    total_attempts as f64 / elapsed
                                 );
 
-                                let rate =
-                                    (attempts.load(Ordering::Relaxed) as f64 / elapsed).round();
+                                let rate = (total_attempts as f64 / elapsed).round();
                                 let secret_bytes = format!("{:?}", secret_full);
                                 let public_bytes = format!("{:?}", kp.public.to_bytes());
                                 let secret_json = serde_json::to_string(&secret_full.to_vec())
                                     .unwrap_or_else(|_| "[]".to_string());
+
                                 let summary = format!(
                                     "[{}] Prefix: {}\nPublic key: {}\nPublic key (bytes): {}\nSecret key (hex): {}\nSecret key (bytes): {}\nSecret key (json array): {}\nAttempts: {}\nRate: {:.0} attempts/s\n",
                                     Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true),
                                     prefix.as_str(),
-                                    pub58,
+                                    pub58_str,
                                     public_bytes,
                                     secret_hex,
                                     secret_bytes,
                                     secret_json,
-                                    attempts.load(Ordering::Relaxed),
+                                    total_attempts,
                                     rate
                                 );
                                 append_block(result_path.as_str(), &summary);
                             }
                             return;
                         }
+                    }
+
+                    if local_attempts > 0 {
+                        attempts.fetch_add(local_attempts, Ordering::Relaxed);
                     }
                 });
             }
