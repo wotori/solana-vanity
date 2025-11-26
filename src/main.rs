@@ -27,11 +27,12 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
-    let prefix = Arc::new(args.prefix);
+    let prefix_str = Arc::new(args.prefix);
+    let prefix_bytes = Arc::new(prefix_str.as_bytes().to_vec());
     let max_matches = args.max_matches;
     let threads = num_cpus::get();
     println!("Using {} threads", threads);
-    println!("Searching for prefix: {}", prefix.as_str());
+    println!("Searching for prefix: {}", prefix_str.as_str());
     match max_matches {
         0 => println!("Will keep mining indefinitely."),
         1 => println!("Will stop after finding 1 match."),
@@ -50,18 +51,17 @@ fn main() {
         let found = Arc::new(AtomicBool::new(false));
         let attempts = Arc::new(AtomicU64::new(0));
         let start = Instant::now();
-        let result_path = Arc::new(next_result_path(prefix.as_str()));
-        println!("Run #{} results file: {}", run_index, result_path.as_str());
+        let result_path = Arc::new(next_result_path(prefix_str.as_str()));
 
+        let start_for_logger = start;
         let logger_attempts = attempts.clone();
         let logger_found = found.clone();
-        let logger_start = start;
         let log_handle = thread::spawn(move || {
             let interval = Duration::from_secs(5);
             loop {
                 thread::sleep(interval);
                 let total = logger_attempts.load(Ordering::Relaxed);
-                let elapsed = logger_start.elapsed().as_secs_f64().max(1.0);
+                let elapsed = start_for_logger.elapsed().as_secs_f64().max(1.0);
                 let rate = (total as f64 / elapsed).round() as u64;
                 let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true);
                 let log_line = format!(
@@ -71,7 +71,6 @@ fn main() {
                     format_with_commas(rate)
                 );
                 println!("{}", log_line);
-                append_block("vanity_progress.log", &log_line);
 
                 if logger_found.load(Ordering::Relaxed) {
                     break;
@@ -79,17 +78,17 @@ fn main() {
             }
         });
 
-        let prefix_for_threads = prefix.clone();
+        let prefix_for_threads = prefix_str.clone();
+        let prefix_bytes_for_threads = prefix_bytes.clone();
 
         scope(|s| {
             for _ in 0..threads {
                 let prefix = prefix_for_threads.clone();
+                let prefix_bytes = prefix_bytes_for_threads.clone();
                 let found = found.clone();
                 let attempts = attempts.clone();
                 let result_path = result_path.clone();
                 let start = start;
-
-                let prefix_bytes = prefix.as_bytes().to_vec();
 
                 s.spawn(move |_| {
                     let mut rng = ChaCha20Rng::from_rng(OsRng).expect("seed rng");
@@ -100,7 +99,7 @@ fn main() {
                         let kp = Keypair::generate(&mut rng);
 
                         local_attempts += 1;
-                        if local_attempts >= 1000 {
+                        if local_attempts >= 100_000 {
                             attempts.fetch_add(local_attempts, Ordering::Relaxed);
                             local_attempts = 0;
                         }
@@ -109,13 +108,13 @@ fn main() {
                             .onto(&mut buffer[..])
                             .unwrap();
 
-                        let pub58_str = std::str::from_utf8(&buffer[..len]).unwrap();
-
-                        if pub58_str.as_bytes().starts_with(&prefix_bytes) {
+                        let candidate = &buffer[..len];
+                        if candidate.starts_with(prefix_bytes.as_slice()) {
                             if !found.swap(true, Ordering::Relaxed) {
                                 attempts.fetch_add(local_attempts, Ordering::Relaxed);
 
                                 println!("Found match!");
+                                let pub58_str = std::str::from_utf8(candidate).unwrap();
                                 println!("Public key: {}", pub58_str);
 
                                 let secret_full = kp.to_bytes();
