@@ -4,4 +4,5 @@ with multi-threaded brute force and live stats.
 
 ```
 cargo run --release -- --prefix ekza --max-matches 0
+RUSTFLAGS="-C target-cpu=native" cargo run --release -- --prefix ekza --max-matches 1
 ```

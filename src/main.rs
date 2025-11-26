@@ -1,7 +1,8 @@
 use chrono::{SecondsFormat, Utc};
 use clap::Parser;
 use ed25519_dalek::Keypair;
-use rand::rngs::OsRng;
+use rand::{rngs::OsRng, SeedableRng};
+use rand_chacha::ChaCha20Rng;
 use rayon::scope;
 use serde_json;
 use std::fs::OpenOptions;
@@ -17,22 +18,42 @@ use std::time::{Duration, Instant};
 #[derive(Parser)]
 #[command(author, version, about = "Solana vanity address finder")]
 struct Args {
-    /// Desired prefix for the base58-encoded public key
-    #[arg(long, default_value = "xyber")]
-    prefix: String,
+    /// One or more desired prefixes for the base58-encoded public key
+    #[arg(long = "prefix", value_name = "PREFIX")]
+    prefixes: Vec<String>,
 
-    /// Number of matches to find before exiting (0 = run forever)
     #[arg(long = "max-matches", default_value_t = 1)]
     max_matches: u64,
+
+    /// Treat prefix matching as case-insensitive (ASCII)
+    #[arg(long = "ignore-case", default_value_t = false)]
+    ignore_case: bool,
 }
 
 fn main() {
     let args = Args::parse();
-    let prefix = Arc::new(args.prefix);
+    let prefixes = expand_prefixes(&args.prefixes);
+    let prefix_rules = Arc::new(
+        prefixes
+            .into_iter()
+            .map(|raw| PrefixRule {
+                bytes: raw.as_bytes().to_vec(),
+                raw,
+            })
+            .collect::<Vec<_>>(),
+    );
     let max_matches = args.max_matches;
+    let ignore_case = args.ignore_case;
     let threads = num_cpus::get();
     println!("Using {} threads", threads);
-    println!("Searching for prefix: {}", prefix.as_str());
+    println!(
+        "Searching for prefixes: {}",
+        prefix_rules
+            .iter()
+            .map(|p| p.raw.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     match max_matches {
         0 => println!("Will keep mining indefinitely."),
         1 => println!("Will stop after finding 1 match."),
@@ -51,18 +72,15 @@ fn main() {
         let found = Arc::new(AtomicBool::new(false));
         let attempts = Arc::new(AtomicU64::new(0));
         let start = Instant::now();
-        let result_path = Arc::new(next_result_path(prefix.as_str()));
-        println!("Run #{} results file: {}", run_index, result_path.as_str());
-
+        let start_for_logger = start;
         let logger_attempts = attempts.clone();
         let logger_found = found.clone();
-        let logger_start = start;
         let log_handle = thread::spawn(move || {
             let interval = Duration::from_secs(5);
             loop {
                 thread::sleep(interval);
                 let total = logger_attempts.load(Ordering::Relaxed);
-                let elapsed = logger_start.elapsed().as_secs_f64().max(1.0);
+                let elapsed = start_for_logger.elapsed().as_secs_f64().max(1.0);
                 let rate = (total as f64 / elapsed).round() as u64;
                 let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true);
                 let log_line = format!(
@@ -72,7 +90,6 @@ fn main() {
                     format_with_commas(rate)
                 );
                 println!("{}", log_line);
-                append_block("vanity_progress.log", &log_line);
 
                 if logger_found.load(Ordering::Relaxed) {
                     break;
@@ -80,60 +97,86 @@ fn main() {
             }
         });
 
-        let prefix_for_threads = prefix.clone();
+        let prefix_rules_for_threads = prefix_rules.clone();
+
         scope(|s| {
             for _ in 0..threads {
-                let prefix = prefix_for_threads.clone();
                 let found = found.clone();
                 let attempts = attempts.clone();
-                let result_path = result_path.clone();
                 let start = start;
+                let rules = prefix_rules_for_threads.clone();
 
                 s.spawn(move |_| {
-                    let mut rng = OsRng {};
+                    let mut rng = ChaCha20Rng::from_rng(OsRng).expect("seed rng");
+                    let mut buffer = [0u8; 64];
+                    let mut local_attempts = 0u64;
+
                     while !found.load(Ordering::Relaxed) {
                         let kp = Keypair::generate(&mut rng);
-                        attempts.fetch_add(1, Ordering::Relaxed);
 
-                        let pub58 = bs58::encode(kp.public.to_bytes()).into_string();
+                        local_attempts += 1;
+                        if local_attempts >= 100_000 {
+                            attempts.fetch_add(local_attempts, Ordering::Relaxed);
+                            local_attempts = 0;
+                        }
 
-                        if pub58.starts_with(prefix.as_str()) {
+                        let len = bs58::encode(kp.public.to_bytes())
+                            .onto(&mut buffer[..])
+                            .unwrap();
+
+                        let candidate = &buffer[..len];
+                        if let Some(rule) =
+                            rules
+                                .iter()
+                                .find(|rule| candidate_matches(candidate, &rule.bytes, ignore_case))
+                        {
                             if !found.swap(true, Ordering::Relaxed) {
+                                attempts.fetch_add(local_attempts, Ordering::Relaxed);
+
                                 println!("Found match!");
-                                println!("Public key: {}", pub58);
-                                // kp.to_bytes() returns 64 bytes: secret + public
+                                let pub58_str = std::str::from_utf8(candidate).unwrap();
+                                println!("Public key: {}", pub58_str);
+
                                 let secret_full = kp.to_bytes();
                                 let secret_hex = hex::encode(secret_full);
                                 println!("Secret key (hex): {}", secret_hex);
+
                                 let elapsed = start.elapsed().as_secs_f64();
+                                let total_attempts = attempts.load(Ordering::Relaxed);
+
                                 println!(
                                     "Attempts: {} ({:.0} / sec)",
-                                    attempts.load(Ordering::Relaxed),
-                                    attempts.load(Ordering::Relaxed) as f64 / elapsed
+                                    total_attempts,
+                                    total_attempts as f64 / elapsed
                                 );
 
-                                let rate =
-                                    (attempts.load(Ordering::Relaxed) as f64 / elapsed).round();
+                                let rate = (total_attempts as f64 / elapsed).round();
                                 let secret_bytes = format!("{:?}", secret_full);
                                 let public_bytes = format!("{:?}", kp.public.to_bytes());
                                 let secret_json = serde_json::to_string(&secret_full.to_vec())
                                     .unwrap_or_else(|_| "[]".to_string());
+
                                 let summary = format!(
                                     "[{}] Prefix: {}\nPublic key: {}\nPublic key (bytes): {}\nSecret key (hex): {}\nSecret key (bytes): {}\nSecret key (json array): {}\nAttempts: {}\nRate: {:.0} attempts/s\n",
                                     Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true),
-                                    prefix.as_str(),
-                                    pub58,
+                                    rule.raw.as_str(),
+                                    pub58_str,
                                     public_bytes,
                                     secret_hex,
                                     secret_bytes,
                                     secret_json,
-                                    attempts.load(Ordering::Relaxed),
+                                    total_attempts,
                                     rate
                                 );
-                                append_block(result_path.as_str(), &summary);
+                                let result_file = next_result_path(rule.raw.as_str());
+                                append_block(result_file.as_str(), &summary);
                             }
                             return;
                         }
+                    }
+
+                    if local_attempts > 0 {
+                        attempts.fetch_add(local_attempts, Ordering::Relaxed);
                     }
                 });
             }
@@ -182,4 +225,51 @@ fn append_block(path: &str, block: &str) {
     {
         eprintln!("Failed to write to {}: {}", path, err);
     }
+}
+
+#[derive(Clone)]
+struct PrefixRule {
+    raw: String,
+    bytes: Vec<u8>,
+}
+
+fn expand_prefixes(raw_list: &[String]) -> Vec<String> {
+    let mut expanded = Vec::new();
+    if raw_list.is_empty() {
+        expanded.push("xyber".to_string());
+        return expanded;
+    }
+
+    for item in raw_list {
+        for part in item.split(',') {
+            let trimmed = part.trim();
+            if !trimmed.is_empty() {
+                expanded.push(trimmed.to_string());
+            }
+        }
+    }
+
+    if expanded.is_empty() {
+        expanded.push("xyber".to_string());
+    }
+
+    expanded
+}
+
+fn candidate_matches(candidate: &[u8], prefix: &[u8], ignore_case: bool) -> bool {
+    if candidate.len() < prefix.len() {
+        return false;
+    }
+    if !ignore_case {
+        candidate[..prefix.len()] == prefix[..]
+    } else {
+        candidate[..prefix.len()]
+            .iter()
+            .zip(prefix.iter())
+            .all(|(a, b)| eq_ignore_ascii_case(*a, *b))
+    }
+}
+
+fn eq_ignore_ascii_case(a: u8, b: u8) -> bool {
+    a == b || a.to_ascii_lowercase() == b.to_ascii_lowercase()
 }
