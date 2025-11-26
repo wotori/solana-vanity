@@ -7,17 +7,15 @@ use chrono::{SecondsFormat, Utc};
 use crate::miner::VanityResult;
 
 pub fn print_and_save_result(result: &VanityResult) {
-    let pub58_str = bs58::encode(result.keypair.public.to_bytes()).into_string();
-    let secret_full = result.keypair.to_bytes();
-    let secret_hex = hex::encode(secret_full);
-    let secret_bytes = format!("{secret_full:?}");
-    let public_bytes = format!("{:?}", result.keypair.public.to_bytes());
-    let secret_json = serde_json::to_string(&secret_full.to_vec()).unwrap_or_else(|_| "[]".into());
+    let bm = &result.backend_match;
+    let public_bytes = format!("{:?}", bm.public_bytes);
+    let secret_bytes = format!("{:?}", bm.secret_bytes);
 
     println!("Found match!");
-    println!("Prefix: {}", result.prefix);
-    println!("Public key: {pub58_str}");
-    println!("Secret key (hex): {secret_hex}");
+    println!("Backend: {}", result.backend_name);
+    println!("Prefix: {}", bm.prefix);
+    println!("Address / public: {}", bm.public_str);
+    println!("Secret key (hex): {}", bm.secret_hex);
     println!(
         "Attempts: {} ({:.0} / sec)",
         result.stats.attempts, result.stats.rate
@@ -25,28 +23,30 @@ pub fn print_and_save_result(result: &VanityResult) {
     println!("Elapsed: {:.2} sec", result.stats.elapsed_secs);
 
     let summary = format!(
-        "[{}] Prefix: {}\n\
-         Public key: {}\n\
-         Public key (bytes): {}\n\
-         Secret key (hex): {}\n\
-         Secret key (bytes): {}\n\
-         Secret key (json array): {}\n\
+        "[{}] Backend: {}\n\
+         Prefix: {}\n\
+         Public: {}\n\
+         Public (bytes): {}\n\
+         Secret (hex): {}\n\
+         Secret (bytes): {}\n\
+         Secret (json array): {}\n\
          Attempts: {}\n\
          Elapsed: {:.2} sec\n\
          Rate: {:.0} attempts/s\n",
         Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true),
-        result.prefix,
-        pub58_str,
+        result.backend_name,
+        bm.prefix,
+        bm.public_str,
         public_bytes,
-        secret_hex,
+        bm.secret_hex,
         secret_bytes,
-        secret_json,
+        bm.secret_json,
         result.stats.attempts,
         result.stats.elapsed_secs,
         result.stats.rate,
     );
 
-    let result_file = next_result_path(&result.prefix);
+    let result_file = next_result_path(&bm.prefix);
     append_block(&result_file, &summary);
 }
 

@@ -1,3 +1,4 @@
+mod backend;
 mod config;
 mod matcher;
 mod miner;

@@ -6,12 +6,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use chrono::{SecondsFormat, Utc};
-use ed25519_dalek::Keypair;
 use rand::{rngs::OsRng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
+use crate::backend::{BackendMatch, VanityBackend};
 use crate::config::Config;
-use crate::matcher::{candidate_matches, PrefixRule};
+use crate::matcher::PrefixRule;
 
 #[derive(Clone, Debug)]
 pub struct MiningStats {
@@ -21,8 +21,8 @@ pub struct MiningStats {
 }
 
 pub struct VanityResult {
-    pub prefix: String,
-    pub keypair: Keypair,
+    pub backend_name: &'static str,
+    pub backend_match: BackendMatch,
     pub stats: MiningStats,
 }
 
@@ -36,6 +36,7 @@ pub fn mine_one_round(config: &Config) -> VanityResult {
 
     let rules = config.prefix_rules.clone();
     let ignore_case = config.ignore_case;
+    let backend = config.backend.clone();
 
     thread::scope(|scope| {
         for _ in 0..config.threads {
@@ -43,9 +44,10 @@ pub fn mine_one_round(config: &Config) -> VanityResult {
             let attempts = attempts.clone();
             let rules = rules.clone();
             let result = result.clone();
+            let backend = backend.clone();
 
             scope.spawn(move || {
-                worker_loop(found, attempts, rules, ignore_case, start, result);
+                worker_loop(found, attempts, rules, ignore_case, start, result, backend);
             });
         }
     });
@@ -104,28 +106,21 @@ fn worker_loop(
     ignore_case: bool,
     start: Instant,
     result: Arc<Mutex<Option<VanityResult>>>,
+    backend: Arc<dyn VanityBackend>,
 ) {
     let mut rng = ChaCha20Rng::from_rng(OsRng).expect("seed rng");
-    let mut buffer = [0u8; 64];
+    let mut buffer = [0u8; 128];
     let mut local_attempts = 0u64;
 
     while !found.load(Ordering::Relaxed) {
-        let kp = Keypair::generate(&mut rng);
-
         local_attempts += 1;
         if local_attempts >= 100_000 {
             attempts.fetch_add(local_attempts, Ordering::Relaxed);
             local_attempts = 0;
         }
 
-        let len = bs58::encode(kp.public.to_bytes())
-            .onto(&mut buffer[..])
-            .expect("base58 buffer too small");
-        let candidate = &buffer[..len];
-
-        if let Some(rule) = rules
-            .iter()
-            .find(|rule| candidate_matches(candidate, &rule.bytes, ignore_case))
+        if let Some(backend_match) =
+            backend.try_generate_match(&mut rng, &rules, ignore_case, &mut buffer)
         {
             if !found.swap(true, Ordering::Relaxed) {
                 if local_attempts > 0 {
@@ -143,8 +138,8 @@ fn worker_loop(
                 };
 
                 let vr = VanityResult {
-                    prefix: rule.raw.clone(),
-                    keypair: kp,
+                    backend_name: backend.name(),
+                    backend_match,
                     stats,
                 };
 

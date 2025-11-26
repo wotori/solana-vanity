@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 
+use crate::backend::{SolanaBackend, VanityBackend};
 use crate::matcher::PrefixRule;
 
 #[derive(Parser)]
@@ -26,6 +27,7 @@ pub struct Config {
     pub max_matches: u64,
     pub ignore_case: bool,
     pub threads: usize,
+    pub backend: Arc<dyn VanityBackend>,
 }
 
 pub fn parse_config() -> Config {
@@ -44,11 +46,14 @@ pub fn parse_config() -> Config {
 
     let threads = num_cpus::get();
 
+    let backend: Arc<dyn VanityBackend> = Arc::new(SolanaBackend);
+
     Config {
         prefix_rules,
         max_matches: args.max_matches,
         ignore_case: args.ignore_case,
         threads,
+        backend,
     }
 }
 
